@@ -1,6 +1,17 @@
 # Meshtasticator
 Discrete-event and interactive simulator for [Meshtastic](https://meshtastic.org/). 
 
+## Custom Enhancements
+
+This fork includes additional functionality developed to enhance the routing behavior in the discrete-event simulator. Key modifications include:
+
+- Integration of a routing table mechanism for improved message forwarding.
+- Addition of a `smart_forward()` function for selective rebroadcast based on routing decisions.
+- Modified the `transmit()` method to support directed transmission instead of naive flooding.
+- Added dynamic routing table updates based on observed hop counts to improve shortest-path selection.
+
+These changes aim to simulate more scalable, and bandwidth-efficient mesh network behavior compared to the default managed flooding.
+
 ## Discrete-event simulator
 The discrete-event simulator mimics the radio section of the device software in order to understand its working. It can also be used to assess the performance of your scenario, or the scalability of the protocol. 
 
