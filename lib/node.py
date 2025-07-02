@@ -25,7 +25,7 @@ class MeshNode:
             self.isRouter = nodeConfig['isRouter']
             self.isRepeater = nodeConfig['isRepeater']
             self.isClientMute = nodeConfig['isClientMute']
-            self.hopLimit = nodeConfig['hopLimit']
+            self.hopLimit = nodeConfig['hopLimit']    # for clarity, hop represents the numebr of times the packet can be forwarded
             self.antennaGain = nodeConfig['antennaGain']
         else:
             self.x, self.y = find_random_position(self.conf, nodes)
@@ -47,6 +47,7 @@ class MeshNode:
         self.packets = packets
         self.delays = delays
         self.leastReceivedHopLimit = {}
+        self.routingTable = {}  # routing table for the node -> {destId: (nextHop, hopLimit)}
         self.isReceiving = []
         self.isTransmitting = False
         self.usefulPackets = 0
@@ -87,6 +88,24 @@ class MeshNode:
 
             env.process(self.move_node(env))
 
+    # function to dyniamically update the next node in the routing table
+    def updateRoutingTable(self, origin, sender, hopCount):
+        if origin == self.nodeid:
+            # If the origin is this node, we don't update the routing table
+            return
+        if origin not in self.routingTable:
+            self.routingTable[origin] = {
+                "nextHop": sender,
+                "cost": hopCount
+            }
+        else:
+            if hopCount < self.routingTable[origin]["cost"]:
+                # If the new hop count is lower, update the routing table
+                self.routingTable[origin] = {
+                    "nextHop": sender,
+                    "cost": hopCount
+                }
+        
     def track_channel_utilization(self, env):
         """
         Periodically compute how many seconds of airtime this node consumed
@@ -218,6 +237,7 @@ class MeshNode:
             else:  # do not send this message anymore, since it is close to the end of the simulation
                 break
 
+    # Transmit a packet, with listen-before-talk and collision detection
     def transmit(self, packet):
         with self.transmitter.request() as request:
             yield request
@@ -240,10 +260,21 @@ class MeshNode:
             if self.leastReceivedHopLimit[packet.seq] > packet.hopLimit:  # no ACK received yet, so may start transmitting
                 self.verboseprint('At time', round(self.env.now, 3), 'node', self.nodeid, 'started low level send', packet.seq, 'hopLimit', packet.hopLimit, 'original Tx', packet.origTxNodeId)
                 self.nrPacketsSent += 1
-                for rx_node in self.nodes:
-                    if packet.sensedByN[rx_node.nodeid]:
-                        if check_collision(self.conf, self.env, packet, rx_node.nodeid, self.packetsAtN) == 0:
-                            self.packetsAtN[rx_node.nodeid].append(packet)
+                
+                # transmit to all neighbors
+                # flood if picked flooding or if no routing table 
+                if self.conf.SELECTED_ROUTER_TYPE == self.conf.ROUTER_TYPE.MANAGED_FLOOD or self.routingTable is None:
+                    for rx_node in self.nodes:
+                        if packet.sensedByN[rx_node.nodeid]:
+                            if check_collision(self.conf, self.env, packet, rx_node.nodeid, self.packetsAtN) == 0:
+                                self.packetsAtN[rx_node.nodeid].append(packet)
+                elif self.conf.SELECTED_ROUTER_TYPE == self.conf.ROUTER_TYPE.MANAGED_ROUTING_TABLE:
+                    route = self.routingTable.get(packet.destId, None)
+                    if route is not None:
+                        next_hop = route["nextHop"]
+                        if packet.sensedByN[next_hop]:
+                            if check_collision(self.conf, self.env, packet, next_hop, self.packetsAtN) == 0:
+                                self.packetsAtN[next_hop].append(packet)
                 packet.startTime = self.env.now
                 packet.endTime = self.env.now + packet.timeOnAir
                 self.txAirUtilization += packet.timeOnAir
@@ -255,6 +286,35 @@ class MeshNode:
             else:  # received ACK: abort transmit, remove from packets generated
                 self.verboseprint('At time', round(self.env.now, 3), 'node', self.nodeid, 'in the meantime received ACK, abort packet with seq. nr', packet.seq)
                 self.packets.remove(packet)
+    
+    def smart_forward(self, p):
+        if p.hopLimit <= 0:
+            self.verboseprint(f"Node {self.nodeid}: hop limit expired for packet {p.seq}")
+            return
+
+        pNew = MeshPacket(
+            self.conf, self.nodes, p.origTxNodeId, p.destId, self.nodeid,
+            p.packetLen, p.seq, p.genTime, p.wantAck, False, None, self.env.now, self.verboseprint
+        )
+        pNew.hopLimit = p.hopLimit - 1
+
+        route = self.routingTable.get(p.destId, None)
+
+        if route is not None:
+            # send to next hop if it exists in the routing table
+            next_hop = route["nextHop"]
+            if p.sensedByN[next_hop]:  # check if next hop is reachable    
+                self.verboseprint(f"Node {self.nodeid} forwards packet {p.seq} to {next_hop}")
+                self.packets.append(pNew)
+                self.env.process(self.transmit(pNew))
+            else:
+                self.verboseprint(f"Node {self.nodeid} can't reach next_hop {next_hop}, dropping packet {p.seq}")
+        else:
+            # flood the packet if no route is found
+            self.verboseprint(f"Node {self.nodeid} has no route to {p.destId}, flooding packet {p.seq}")
+            self.packets.append(pNew)
+            self.env.process(self.transmit(pNew))
+
 
     def receive(self, in_pipe):
         while True:
@@ -280,6 +340,8 @@ class MeshNode:
                 p.receivedAtN[self.nodeid] = True
                 self.verboseprint('At time', round(self.env.now, 3), 'node', self.nodeid, 'received packet', p.seq, 'with delay', round(self.env.now - p.genTime, 2))
                 self.delays.append(self.env.now - p.genTime)
+                self.updateRoutingTable(p.origTxNodeId, p.txNodeId, self.hopLimit - p.hopLimit + 1)
+
 
                 # update hopLimit for this message
                 if p.seq not in self.leastReceivedHopLimit:  # did not yet receive packet with this seq nr.
@@ -326,10 +388,17 @@ class MeshNode:
                     # FloodingRouter: rebroadcast received packet
                     if self.conf.SELECTED_ROUTER_TYPE == self.conf.ROUTER_TYPE.MANAGED_FLOOD:
                         if not self.isClientMute:
+                            #print("FLODDING!!!!!!") # debug
                             self.verboseprint('At time', round(self.env.now, 3), 'node', self.nodeid, 'rebroadcasts received packet', p.seq)
                             pNew = MeshPacket(self.conf, self.nodes, p.origTxNodeId, p.destId, self.nodeid, p.packetLen, p.seq, p.genTime, p.wantAck, False, None, self.env.now, self.verboseprint)
-                            pNew.hopLimit = p.hopLimit - 1
+                            pNew.hopLimit = p.hopLimit - 1  
                             self.packets.append(pNew)
-                            self.env.process(self.transmit(pNew))
+                            self.env.process(self.transmit(pNew))   # transmit rebroadcasted packet
+                    # Transit packet with routing table method
+                    elif self.conf.SELECTED_ROUTER_TYPE == self.conf.ROUTER_TYPE.MANAGED_ROUTING_TABLE:
+                        if not self.isClientMute:
+                            #print("here") # debug
+                            self.verboseprint('At time', round(self.env.now, 3), 'node', self.nodeid, 'smart-forwards received packet', p.seq)
+                            self.smart_forward(p)
                 else:
                     self.droppedByDelay += 1
