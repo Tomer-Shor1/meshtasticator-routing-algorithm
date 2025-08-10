@@ -48,6 +48,8 @@ class MeshNode:
         self.delays = delays
         self.leastReceivedHopLimit = {}
         self.routingTable = {}  # routing table for the node -> {destId: (nextHop, hopLimit)}
+        self.packets_queue = []
+        self.nrPacketsSent = 0
         self.isReceiving = []
         self.isTransmitting = False
         self.usefulPackets = 0
@@ -105,7 +107,31 @@ class MeshNode:
                     "nextHop": sender,
                     "cost": hopCount
                 }
-        
+
+    # Simple congestion metric based on the number of packets in the queue
+    def get_congestion(self):
+        """Return a simple congestion metric"""
+        return len(self.packets_queue) 
+    
+    # Choose next hop based on congestion
+    def choose_next_hop_with_congestion(self, destId):
+        """Decide next hop based on congestion"""
+        route = self.routingTable.get(destId)
+        if route:
+            next_hop = route["nextHop"]
+            # find the neighbor node with the next hop
+            neighbor_node = next((n for n in self.nodes if n.nodeid == next_hop), None)
+            if neighbor_node:           # if the neighbor node exists
+                congestion = neighbor_node.get_congestion()
+                if congestion < self.conf.MAX_CONGESTION_THRESHOLD:
+                    self.verboseprint(f"[CC] Node {self.nodeid}: {next_hop} congestion={congestion} → OK")
+                    return next_hop
+                else:   # if congestion is too high, return None to indicate fallback
+                    self.verboseprint(f"[CC] Node {self.nodeid}: {next_hop} congestion={congestion} → TOO HIGH, fallback")
+                    return None
+        self.verboseprint(f"[CC] Node {self.nodeid}: No route found → fallback")
+        return None
+
     def track_channel_utilization(self, env):
         """
         Periodically compute how many seconds of airtime this node consumed
@@ -242,77 +268,102 @@ class MeshNode:
         with self.transmitter.request() as request:
             yield request
 
-            # listen-before-talk from src/mesh/RadioLibInterface.cpp
+            # Listen-Before-Talk (backoff)
             txTime = set_transmit_delay(self, packet)
-            self.verboseprint('At time', round(self.env.now, 3), 'node', self.nodeid, 'picked wait time', txTime)
+            self.verboseprint(f"[TX] t={round(self.env.now,3)} node={self.nodeid} backoff={txTime}")
             yield self.env.timeout(txTime)
 
-            # wait when currently receiving or transmitting, or channel is active
+            # Wait if channel or node is currently busy
             while any(self.isReceiving) or self.isTransmitting or is_channel_active(self, self.env):
-                self.verboseprint('At time', round(self.env.now, 3), 'node', self.nodeid, 'is busy Tx-ing', self.isTransmitting, 'or Rx-ing', any(self.isReceiving), 'else channel busy!')
                 txTime = set_transmit_delay(self, packet)
+                self.verboseprint(f"[TX] t={round(self.env.now,3)} node={self.nodeid} busy → wait {txTime}")
                 yield self.env.timeout(txTime)
-            self.verboseprint('At time', round(self.env.now, 3), 'node', self.nodeid, 'ends waiting')
 
-            # check if you received an ACK for this message in the meantime
+            # ACK / TTL bookkeeping
             if packet.seq not in self.leastReceivedHopLimit:
                 self.leastReceivedHopLimit[packet.seq] = packet.hopLimit + 1
-            if self.leastReceivedHopLimit[packet.seq] > packet.hopLimit:  # no ACK received yet, so may start transmitting
-                self.verboseprint('At time', round(self.env.now, 3), 'node', self.nodeid, 'started low level send', packet.seq, 'hopLimit', packet.hopLimit, 'original Tx', packet.origTxNodeId)
-                self.nrPacketsSent += 1
-                
-                # transmit to all neighbors
-                # flood if picked flooding or if no routing table 
-                if self.conf.SELECTED_ROUTER_TYPE == self.conf.ROUTER_TYPE.MANAGED_FLOOD or self.routingTable is None:
-                    for rx_node in self.nodes:
-                        if packet.sensedByN[rx_node.nodeid]:
-                            if check_collision(self.conf, self.env, packet, rx_node.nodeid, self.packetsAtN) == 0:
-                                self.packetsAtN[rx_node.nodeid].append(packet)
-                elif self.conf.SELECTED_ROUTER_TYPE == self.conf.ROUTER_TYPE.MANAGED_ROUTING_TABLE:
-                    route = self.routingTable.get(packet.destId, None)
-                    if route is not None:
-                        next_hop = route["nextHop"]
-                        if packet.sensedByN[next_hop]:
-                            if check_collision(self.conf, self.env, packet, next_hop, self.packetsAtN) == 0:
-                                self.packetsAtN[next_hop].append(packet)
-                packet.startTime = self.env.now
-                packet.endTime = self.env.now + packet.timeOnAir
-                self.txAirUtilization += packet.timeOnAir
-                self.airUtilization += packet.timeOnAir
-                self.bc_pipe.put(packet)
-                self.isTransmitting = True
-                yield self.env.timeout(packet.timeOnAir)
-                self.isTransmitting = False
-            else:  # received ACK: abort transmit, remove from packets generated
-                self.verboseprint('At time', round(self.env.now, 3), 'node', self.nodeid, 'in the meantime received ACK, abort packet with seq. nr', packet.seq)
-                self.packets.remove(packet)
+            if self.leastReceivedHopLimit[packet.seq] <= packet.hopLimit:
+                # Already ACKed / better copy received → abort this tx
+                self.verboseprint(f"[TX] t={round(self.env.now,3)} node={self.nodeid} abort seq={packet.seq} (acked earlier)")
+
+                # SAFE removal (packet may have been removed elsewhere)
+                if packet in self.packets:
+                    self.packets.remove(packet)
+                else:
+                    self.verboseprint(f"[TX] node={self.nodeid} seq={packet.seq} not in self.packets; skip removal")
+
+                return
+
+            self.verboseprint(f"[TX] t={round(self.env.now,3)} node={self.nodeid} send seq={packet.seq} hopLimit={packet.hopLimit}")
+            self.nrPacketsSent += 1
+
+            # ---------- Target selection ----------
+            def flood_targets():
+                """Return all nodes that can hear this transmission"""
+                return [n.nodeid for n in self.nodes if packet.sensedByN[n.nodeid]]
+
+            targets = flood_targets()  # Default: flood
+            if self.conf.SELECTED_ROUTER_TYPE == self.conf.ROUTER_TYPE.MANAGED_ROUTING_TABLE and self.routingTable is not None:
+                route = self.routingTable.get(packet.destId)
+                if route:
+                    nh = route.get("nextHop")
+                    if nh is not None and packet.sensedByN[nh]:
+                        targets = [nh]  # change target to next hop only
+                        self.verboseprint(f"[TX] node={self.nodeid} unicast→{nh} (dest={packet.destId})")
+                    else:
+                        self.verboseprint(f"[TX] node={self.nodeid} no valid nextHop → flood")
+                else:
+                    self.verboseprint(f"[TX] node={self.nodeid} no route for dest={packet.destId} → flood")
+            else:
+                self.verboseprint(f"[TX] node={self.nodeid} router=FLOOD → flood")
+
+            # ---------- Physical transmission ----------
+            for rx_id in targets:
+                if check_collision(self.conf, self.env, packet, rx_id, self.packetsAtN) == 0:
+                    self.packetsAtN[rx_id].append(packet)
+
+            # Timing and air utilization stats
+            packet.startTime = self.env.now
+            packet.endTime = self.env.now + packet.timeOnAir
+            self.txAirUtilization += packet.timeOnAir
+            self.airUtilization += packet.timeOnAir
+            self.bc_pipe.put(packet)
+            self.isTransmitting = True
+            yield self.env.timeout(packet.timeOnAir)
+            self.isTransmitting = False
     
-    def smart_forward(self, p):
-        if p.hopLimit <= 0:
-            self.verboseprint(f"Node {self.nodeid}: hop limit expired for packet {p.seq}")
+    def smart_forward(self, packet):
+        """Forward packet using routing table + congestion check"""
+        if packet.hopLimit <= 0:        # if hop limit expired, do not forward
+            self.verboseprint(f"[SF] Node {self.nodeid}: hop limit expired for packet {packet.seq}")
             return
 
         pNew = MeshPacket(
-            self.conf, self.nodes, p.origTxNodeId, p.destId, self.nodeid,
-            p.packetLen, p.seq, p.genTime, p.wantAck, False, None, self.env.now, self.verboseprint
-        )
-        pNew.hopLimit = p.hopLimit - 1
+            self.conf,
+            self.nodes,
+            packet.origTxNodeId,      # origin stays the same
+            packet.destId,            # destination stays the same
+            self.nodeid,              # this node is now the transmitter
+            packet.packetLen,         # same payload length
+            packet.seq,               # same message sequence
+            packet.genTime,           # original generation time (for end-to-end delay stats)
+            packet.wantAck,           # preserve reliability requirement
+            False,               # isAck=False (this is a data forward)
+            None,                
+            self.env.now,        
+            self.verboseprint
+            )
 
-        route = self.routingTable.get(p.destId, None)
+        pNew.hopLimit -= 1
 
-        if route is not None:
-            # send to next hop if it exists in the routing table
-            next_hop = route["nextHop"]
-            if p.sensedByN[next_hop]:  # check if next hop is reachable    
-                self.verboseprint(f"Node {self.nodeid} forwards packet {p.seq} to {next_hop}")
-                self.packets.append(pNew)
-                self.env.process(self.transmit(pNew))
-            else:
-                self.verboseprint(f"Node {self.nodeid} can't reach next_hop {next_hop}, dropping packet {p.seq}")
+        next_hop = self.choose_next_hop_with_congestion(pNew.destId)
+        if next_hop is not None:
+            self.verboseprint(f"[SF] Node {self.nodeid}: Routing packet {packet.seq} → {next_hop}")
+            self.packets_queue.append(pNew)
+            self.env.process(self.transmit(pNew, specific_receiver=next_hop))
         else:
-            # flood the packet if no route is found
-            self.verboseprint(f"Node {self.nodeid} has no route to {p.destId}, flooding packet {p.seq}")
-            self.packets.append(pNew)
+            self.verboseprint(f"[SF] Node {self.nodeid}: Flooding packet {packet.seq}")
+            self.packets_queue.append(pNew)
             self.env.process(self.transmit(pNew))
 
 
